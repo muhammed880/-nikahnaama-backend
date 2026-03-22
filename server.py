@@ -104,6 +104,9 @@ async def init_db():
                 mehr_amount TEXT,
                 witnesses JSONB DEFAULT '[]',
                 couple_photo TEXT DEFAULT '',
+                venue_name TEXT DEFAULT '',
+                imam_name TEXT DEFAULT '',
+                wakeel TEXT DEFAULT '',
                 status TEXT DEFAULT 'registered',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -244,6 +247,9 @@ class NikahCreate(BaseModel):
     mehr_amount: str
     witnesses: List[str] = []
     couple_photo: str = ""
+    venue_name: str = ""
+    imam_name: str = ""
+    wakeel: str = ""
 
 class MatrimonyCreate(BaseModel):
     masjid_id: str
@@ -609,12 +615,13 @@ async def create_nikah(nikah_data: NikahCreate, token: Dict = Depends(verify_tok
         certificate_id = f"NK{datetime.now().strftime('%Y%m%d')}{nikah_id[:6].upper()}"
         
         await conn.execute('''
-            INSERT INTO nikahs (id, certificate_id, masjid_id, masjid_name, groom, bride, nikah_date, mehr_amount, witnesses, couple_photo)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            INSERT INTO nikahs (id, certificate_id, masjid_id, masjid_name, groom, bride, nikah_date, mehr_amount, witnesses, couple_photo, venue_name, imam_name, wakeel)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ''', nikah_id, certificate_id, nikah_data.masjid_id, masjid_name,
             json.dumps(nikah_data.groom.dict()), json.dumps(nikah_data.bride.dict()),
             nikah_data.nikah_date, nikah_data.mehr_amount,
-            json.dumps(nikah_data.witnesses), nikah_data.couple_photo)
+            json.dumps(nikah_data.witnesses), nikah_data.couple_photo,
+            nikah_data.venue_name, nikah_data.imam_name, nikah_data.wakeel)
         
         return {"id": nikah_id, "certificate_id": certificate_id, "masjid_name": masjid_name}
 
