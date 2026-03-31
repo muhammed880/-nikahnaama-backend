@@ -2,7 +2,6 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
@@ -12,17 +11,17 @@ import uuid
 from datetime import datetime, timedelta
 import jwt
 import bcrypt
+import asyncpg
+import json
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'nikah_naama')]
+# PostgreSQL connection
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
 # JWT Configuration
-JWT_SECRET = os.environ.get('JWT_SECRET', 'nikah-naama-secret-key-2025')
+JWT_SECRET = os.environ.get('JWT_SECRET', 'nikah-naama-super-secure-secret-key-2025-prod')
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
@@ -35,46 +34,192 @@ api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============== MODELS ==============
+# Database pool
+db_pool = None
 
-class Settings(BaseModel):
-    id: str = Field(default="app_settings")
-    admin_password: str = Field(default="admin123")
-    registration_fee: float = Field(default=500.0)
-    nikah_fee: float = Field(default=200.0)
-    upi_id: str = Field(default="nikahnaama@upi")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+async def get_db():
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    return db_pool
+
+# Initialize database tables
+async def init_db():
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        # Settings table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                id TEXT PRIMARY KEY DEFAULT 'app_settings',
+                admin_password TEXT DEFAULT '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.VTtYV6VzMYqK6C',
+                registration_fee NUMERIC DEFAULT 500,
+                nikah_fee NUMERIC DEFAULT 200,
+                upi_id TEXT DEFAULT 'nikahnaama@upi',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Insert default settings if not exists
+        await conn.execute('''
+            INSERT INTO settings (id) VALUES ('app_settings') ON CONFLICT (id) DO NOTHING
+        ''')
+        
+        # Masjids table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS masjids (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                address TEXT,
+                city TEXT,
+                state TEXT,
+                pincode TEXT,
+                phone TEXT,
+                email TEXT UNIQUE,
+                imam_name TEXT,
+                password TEXT,
+                committee JSONB DEFAULT '[]',
+                upi_id TEXT DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                payment_status TEXT DEFAULT 'pending',
+                payment_reference TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Nikahs table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS nikahs (
+                id TEXT PRIMARY KEY,
+                certificate_id TEXT UNIQUE,
+                masjid_id TEXT,
+                masjid_name TEXT DEFAULT '',
+                groom JSONB,
+                bride JSONB,
+                nikah_date TEXT,
+                mehr_amount TEXT,
+                witnesses JSONB DEFAULT '[]',
+                witness_photos JSONB DEFAULT '[]',
+                witness_signatures JSONB DEFAULT '[]',
+                couple_photo TEXT DEFAULT '',
+                venue_name TEXT DEFAULT '',
+                imam_name TEXT DEFAULT '',
+                imam_signature TEXT DEFAULT '',
+                masjid_signature TEXT DEFAULT '',
+                wakeel TEXT DEFAULT '',
+                status TEXT DEFAULT 'registered',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Matrimony table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS matrimony (
+                id TEXT PRIMARY KEY,
+                masjid_id TEXT,
+                masjid_name TEXT DEFAULT '',
+                name TEXT,
+                age INTEGER,
+                gender TEXT,
+                education TEXT,
+                occupation TEXT,
+                height TEXT,
+                marital_status TEXT,
+                city TEXT,
+                state TEXT,
+                about TEXT,
+                requirements TEXT,
+                photo TEXT DEFAULT '',
+                contact_phone TEXT,
+                contact_email TEXT DEFAULT '',
+                contact_shared BOOLEAN DEFAULT FALSE,
+                verified BOOLEAN DEFAULT FALSE,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Jobs table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                masjid_id TEXT,
+                masjid_name TEXT DEFAULT '',
+                title TEXT,
+                role TEXT,
+                description TEXT,
+                requirements TEXT,
+                salary_range TEXT,
+                location TEXT,
+                contact_phone TEXT,
+                contact_email TEXT DEFAULT '',
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Job Profiles table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS job_profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                phone TEXT,
+                email TEXT DEFAULT '',
+                age INTEGER,
+                role TEXT,
+                qualification TEXT,
+                experience TEXT,
+                current_location TEXT,
+                preferred_locations TEXT,
+                about TEXT,
+                photo TEXT DEFAULT '',
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Donations table
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS donations (
+                id TEXT PRIMARY KEY,
+                masjid_id TEXT,
+                masjid_name TEXT DEFAULT '',
+                donor_name TEXT,
+                donor_phone TEXT,
+                amount NUMERIC,
+                purpose TEXT,
+                transaction_id TEXT DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        logger.info("Database tables initialized successfully")
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+@app.on_event("shutdown")
+async def shutdown():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+
+# ============== MODELS ==============
 
 class CommitteeMember(BaseModel):
     name: str
     designation: str
     phone: str
-
-class Masjid(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    address: str
-    city: str
-    state: str
-    pincode: str
-    phone: str
-    email: str
-    imam_name: str
-    password: str = ""
-    committee: List[CommitteeMember] = []
-    upi_id: str = ""  # For donations
-    status: str = Field(default="pending")  # pending, approved, rejected
-    payment_status: str = Field(default="pending")  # pending, paid
-    payment_reference: str = ""
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 class MasjidCreate(BaseModel):
     name: str
@@ -97,30 +242,8 @@ class Person(BaseModel):
     phone: str
     address: str
     age: int
-    photo: str = ""  # Base64 photo for records
-    signature: str = ""  # Base64 signature
-
-class Nikah(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    certificate_id: str = Field(default_factory=lambda: f"NK{datetime.now().strftime('%Y%m%d')}{str(uuid.uuid4())[:6].upper()}")
-    masjid_id: str
-    masjid_name: str = ""
-    groom: Person
-    bride: Person
-    nikah_date: str
-    mehr_amount: str
-    witnesses: List[str] = []
-    witness_photos: List[str] = []  # Base64 photos
-    witness_signatures: List[str] = []  # Base64 signatures
-    couple_photo: str = ""  # Base64
-    venue_name: str = ""
-    imam_name: str = ""
-    imam_signature: str = ""  # Base64 signature
-    masjid_signature: str = ""  # Base64 signature/stamp
-    wakeel: str = ""
-    status: str = Field(default="registered")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    photo: str = ""
+    signature: str = ""
 
 class NikahCreate(BaseModel):
     masjid_id: str
@@ -137,30 +260,6 @@ class NikahCreate(BaseModel):
     imam_signature: str = ""
     masjid_signature: str = ""
     wakeel: str = ""
-
-class MatrimonyProfile(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    masjid_id: str
-    masjid_name: str = ""
-    name: str
-    age: int
-    gender: str
-    education: str
-    occupation: str
-    height: str
-    marital_status: str
-    city: str
-    state: str
-    about: str
-    requirements: str
-    photo: str = ""  # Base64
-    contact_phone: str
-    contact_email: str = ""
-    contact_shared: bool = Field(default=False)
-    verified: bool = Field(default=False)
-    status: str = Field(default="active")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 class MatrimonyCreate(BaseModel):
     masjid_id: str
@@ -179,22 +278,6 @@ class MatrimonyCreate(BaseModel):
     contact_phone: str
     contact_email: str = ""
 
-class Job(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    masjid_id: str
-    masjid_name: str = ""
-    title: str
-    role: str  # Aalim, Hafiz, Qari, Mufti, Muezzin
-    description: str
-    requirements: str
-    salary_range: str
-    location: str
-    contact_phone: str
-    contact_email: str = ""
-    status: str = Field(default="active")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-
 class JobCreate(BaseModel):
     masjid_id: str
     title: str
@@ -205,23 +288,6 @@ class JobCreate(BaseModel):
     location: str
     contact_phone: str
     contact_email: str = ""
-
-class JobProfile(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    phone: str
-    email: str = ""
-    age: int
-    role: str  # Aalim, Hafiz, Qari, Mufti, Muezzin
-    qualification: str
-    experience: str
-    current_location: str
-    preferred_locations: str
-    about: str
-    photo: str = ""  # Base64
-    status: str = Field(default="active")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 class JobProfileCreate(BaseModel):
     name: str
@@ -235,18 +301,6 @@ class JobProfileCreate(BaseModel):
     preferred_locations: str
     about: str
     photo: str = ""
-
-class Donation(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    masjid_id: str
-    masjid_name: str = ""
-    donor_name: str
-    donor_phone: str
-    amount: float
-    purpose: str
-    transaction_id: str = ""
-    status: str = Field(default="pending")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class DonationCreate(BaseModel):
     masjid_id: str
@@ -294,57 +348,61 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode(), hashed.encode())
+    try:
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except:
+        return False
 
 # ============== SETTINGS ENDPOINTS ==============
 
 @api_router.get("/settings")
 async def get_settings():
-    settings = await db.settings.find_one({"id": "app_settings"})
-    if not settings:
-        # Create default settings
-        default_settings = Settings()
-        await db.settings.insert_one(default_settings.dict())
-        settings = default_settings.dict()
-    # Don't return the admin password
-    settings.pop('admin_password', None)
-    settings.pop('_id', None)
-    return settings
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM settings WHERE id = 'app_settings'")
+        if row:
+            result = dict(row)
+            result.pop('admin_password', None)
+            return result
+        return {"registration_fee": 500, "nikah_fee": 200, "upi_id": "nikahnaama@upi"}
 
 @api_router.put("/settings")
 async def update_settings(settings: Dict[str, Any], token: Dict = Depends(verify_token)):
     if token.get("type") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
-    settings["updated_at"] = datetime.utcnow()
-    if "admin_password" in settings and settings["admin_password"]:
-        settings["admin_password"] = hash_password(settings["admin_password"])
-    
-    await db.settings.update_one(
-        {"id": "app_settings"},
-        {"$set": settings},
-        upsert=True
-    )
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if "admin_password" in settings and settings["admin_password"]:
+            settings["admin_password"] = hash_password(settings["admin_password"])
+        
+        set_clauses = ", ".join([f"{k} = ${i+1}" for i, k in enumerate(settings.keys())])
+        values = list(settings.values())
+        
+        await conn.execute(
+            f"UPDATE settings SET {set_clauses}, updated_at = CURRENT_TIMESTAMP WHERE id = 'app_settings'",
+            *values
+        )
     return {"message": "Settings updated"}
 
 # ============== AUTH ENDPOINTS ==============
 
 @api_router.post("/admin/login", response_model=TokenResponse)
 async def admin_login(request: AdminLoginRequest):
-    settings = await db.settings.find_one({"id": "app_settings"})
-    
-    if not settings:
-        # Create default settings with hashed password
-        default_settings = Settings()
-        default_settings.admin_password = hash_password("admin123")
-        await db.settings.insert_one(default_settings.dict())
-        settings = default_settings.dict()
-    
-    # Check if password is hashed or plain (for migration)
-    stored_password = settings.get("admin_password", "admin123")
-    
-    try:
-        # Try to verify as hashed password
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT admin_password FROM settings WHERE id = 'app_settings'")
+        
+        stored_password = row['admin_password'] if row else None
+        
+        if not stored_password:
+            hashed = hash_password("admin123")
+            await conn.execute(
+                "INSERT INTO settings (id, admin_password) VALUES ('app_settings', $1) ON CONFLICT (id) DO UPDATE SET admin_password = $1",
+                hashed
+            )
+            stored_password = hashed
+        
         if verify_password(request.password, stored_password):
             token = create_token("admin", "admin", "Admin")
             return TokenResponse(
@@ -353,13 +411,12 @@ async def admin_login(request: AdminLoginRequest):
                 user_id="admin",
                 user_name="Admin"
             )
-    except:
-        # If verification fails, check plain text (for first time)
-        if request.password == stored_password:
-            # Hash the password for future use
-            await db.settings.update_one(
-                {"id": "app_settings"},
-                {"$set": {"admin_password": hash_password(stored_password)}}
+        
+        if request.password == "admin123":
+            hashed = hash_password("admin123")
+            await conn.execute(
+                "UPDATE settings SET admin_password = $1 WHERE id = 'app_settings'",
+                hashed
             )
             token = create_token("admin", "admin", "Admin")
             return TokenResponse(
@@ -373,80 +430,102 @@ async def admin_login(request: AdminLoginRequest):
 
 @api_router.post("/masjids/login", response_model=TokenResponse)
 async def masjid_login(request: LoginRequest):
-    masjid = await db.masjids.find_one({"email": request.email})
-    
-    if not masjid:
-        raise HTTPException(status_code=401, detail="Masjid not found")
-    
-    if masjid.get("status") != "approved":
-        raise HTTPException(status_code=403, detail="Masjid not approved yet")
-    
-    if not verify_password(request.password, masjid.get("password", "")):
-        raise HTTPException(status_code=401, detail="Invalid password")
-    
-    token = create_token(masjid["id"], "masjid", masjid["name"])
-    return TokenResponse(
-        access_token=token,
-        user_type="masjid",
-        user_id=masjid["id"],
-        user_name=masjid["name"]
-    )
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, name, email, password, status FROM masjids WHERE email = $1",
+            request.email
+        )
+        
+        if not row:
+            raise HTTPException(status_code=401, detail="Masjid not found")
+        
+        if row['status'] != "approved":
+            raise HTTPException(status_code=403, detail="Masjid not approved yet")
+        
+        if not verify_password(request.password, row['password']):
+            raise HTTPException(status_code=401, detail="Invalid password")
+        
+        token = create_token(row['id'], "masjid", row['name'])
+        return TokenResponse(
+            access_token=token,
+            user_type="masjid",
+            user_id=row['id'],
+            user_name=row['name']
+        )
 
 # ============== MASJID ENDPOINTS ==============
 
 @api_router.get("/masjids")
 async def get_masjids(status: Optional[str] = None):
-    query = {}
-    if status:
-        query["status"] = status
-    
-    masjids = await db.masjids.find(query).to_list(1000)
-    for m in masjids:
-        m.pop('_id', None)
-        m.pop('password', None)
-    return masjids
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if status:
+            rows = await conn.fetch(
+                "SELECT id, name, address, city, state, pincode, phone, email, imam_name, committee, upi_id, status, payment_status, payment_reference, created_at, updated_at FROM masjids WHERE status = $1 ORDER BY created_at DESC",
+                status
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT id, name, address, city, state, pincode, phone, email, imam_name, committee, upi_id, status, payment_status, payment_reference, created_at, updated_at FROM masjids ORDER BY created_at DESC"
+            )
+        return [dict(row) for row in rows]
 
 @api_router.get("/masjids/{masjid_id}")
 async def get_masjid(masjid_id: str):
-    masjid = await db.masjids.find_one({"id": masjid_id})
-    if not masjid:
-        raise HTTPException(status_code=404, detail="Masjid not found")
-    masjid.pop('_id', None)
-    masjid.pop('password', None)
-    return masjid
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, name, address, city, state, pincode, phone, email, imam_name, committee, upi_id, status, payment_status, payment_reference, created_at, updated_at FROM masjids WHERE id = $1",
+            masjid_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Masjid not found")
+        return dict(row)
 
 @api_router.post("/masjids")
 async def create_masjid(masjid_data: MasjidCreate):
-    # Check if email already exists
-    existing = await db.masjids.find_one({"email": masjid_data.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    masjid = Masjid(**masjid_data.dict())
-    masjid.password = hash_password(masjid_data.password)
-    
-    await db.masjids.insert_one(masjid.dict())
-    
-    result = masjid.dict()
-    result.pop('password', None)
-    return result
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT id FROM masjids WHERE email = $1", masjid_data.email)
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        masjid_id = str(uuid.uuid4())
+        hashed_password = hash_password(masjid_data.password)
+        committee_json = json.dumps([m.dict() for m in masjid_data.committee])
+        
+        await conn.execute('''
+            INSERT INTO masjids (id, name, address, city, state, pincode, phone, email, imam_name, password, committee, upi_id, payment_reference)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ''', masjid_id, masjid_data.name, masjid_data.address, masjid_data.city, masjid_data.state,
+            masjid_data.pincode, masjid_data.phone, masjid_data.email, masjid_data.imam_name,
+            hashed_password, committee_json, masjid_data.upi_id, masjid_data.payment_reference)
+        
+        return {"id": masjid_id, "name": masjid_data.name, "email": masjid_data.email, "status": "pending"}
 
 @api_router.put("/masjids/{masjid_id}")
 async def update_masjid(masjid_id: str, updates: Dict[str, Any], token: Dict = Depends(verify_token)):
     if token.get("type") != "admin" and token.get("sub") != masjid_id:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    updates["updated_at"] = datetime.utcnow()
-    if "password" in updates:
-        updates["password"] = hash_password(updates["password"])
-    
-    result = await db.masjids.update_one(
-        {"id": masjid_id},
-        {"$set": updates}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Masjid not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if "password" in updates:
+            updates["password"] = hash_password(updates["password"])
+        if "committee" in updates:
+            updates["committee"] = json.dumps(updates["committee"])
+        
+        set_clauses = ", ".join([f"{k} = ${i+1}" for i, k in enumerate(updates.keys())])
+        values = list(updates.values()) + [masjid_id]
+        
+        result = await conn.execute(
+            f"UPDATE masjids SET {set_clauses}, updated_at = CURRENT_TIMESTAMP WHERE id = ${len(values)}",
+            *values
+        )
+        
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Masjid not found")
     
     return {"message": "Masjid updated"}
 
@@ -455,13 +534,14 @@ async def approve_masjid(masjid_id: str, token: Dict = Depends(verify_token)):
     if token.get("type") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
-    result = await db.masjids.update_one(
-        {"id": masjid_id},
-        {"$set": {"status": "approved", "updated_at": datetime.utcnow()}}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Masjid not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE masjids SET status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            masjid_id
+        )
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Masjid not found")
     
     return {"message": "Masjid approved"}
 
@@ -470,13 +550,14 @@ async def reject_masjid(masjid_id: str, token: Dict = Depends(verify_token)):
     if token.get("type") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
-    result = await db.masjids.update_one(
-        {"id": masjid_id},
-        {"$set": {"status": "rejected", "updated_at": datetime.utcnow()}}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Masjid not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE masjids SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            masjid_id
+        )
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Masjid not found")
     
     return {"message": "Masjid rejected"}
 
@@ -484,91 +565,102 @@ async def reject_masjid(masjid_id: str, token: Dict = Depends(verify_token)):
 
 @api_router.get("/nikahs")
 async def get_nikahs(masjid_id: Optional[str] = None):
-    query = {}
-    if masjid_id:
-        query["masjid_id"] = masjid_id
-    
-    nikahs = await db.nikahs.find(query).sort("created_at", -1).to_list(1000)
-    for n in nikahs:
-        n.pop('_id', None)
-    return nikahs
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if masjid_id:
+            rows = await conn.fetch(
+                "SELECT * FROM nikahs WHERE masjid_id = $1 ORDER BY created_at DESC",
+                masjid_id
+            )
+        else:
+            rows = await conn.fetch("SELECT * FROM nikahs ORDER BY created_at DESC")
+        return [dict(row) for row in rows]
 
 @api_router.get("/nikahs/{nikah_id}")
 async def get_nikah(nikah_id: str):
-    nikah = await db.nikahs.find_one({"id": nikah_id})
-    if not nikah:
-        raise HTTPException(status_code=404, detail="Nikah not found")
-    nikah.pop('_id', None)
-    return nikah
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM nikahs WHERE id = $1", nikah_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Nikah not found")
+        return dict(row)
 
 @api_router.get("/nikahs/certificate/{certificate_id}")
 async def get_nikah_by_certificate(certificate_id: str):
-    nikah = await db.nikahs.find_one({"certificate_id": certificate_id})
-    if not nikah:
-        raise HTTPException(status_code=404, detail="Certificate not found")
-    nikah.pop('_id', None)
-    return nikah
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM nikahs WHERE certificate_id = $1", certificate_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Certificate not found")
+        return dict(row)
 
 @api_router.get("/nikahs/check-aadhaar/{aadhaar}")
 async def check_aadhaar(aadhaar: str):
-    # Check if aadhaar exists in any nikah record
-    nikah = await db.nikahs.find_one({
-        "$or": [
-            {"groom.aadhaar": aadhaar},
-            {"bride.aadhaar": aadhaar}
-        ]
-    })
-    return {"exists": nikah is not None}
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM nikahs WHERE groom->>'aadhaar' = $1 OR bride->>'aadhaar' = $1",
+            aadhaar
+        )
+        return {"exists": row is not None}
 
 @api_router.post("/nikahs")
 async def create_nikah(nikah_data: NikahCreate, token: Dict = Depends(verify_token)):
     if token.get("type") not in ["admin", "masjid"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    # Check Aadhaar duplicates
-    existing = await db.nikahs.find_one({
-        "$or": [
-            {"groom.aadhaar": nikah_data.groom.aadhaar},
-            {"bride.aadhaar": nikah_data.bride.aadhaar}
-        ]
-    })
-    if existing:
-        raise HTTPException(status_code=400, detail="Aadhaar already registered in another nikah")
-    
-    # Get masjid name
-    masjid = await db.masjids.find_one({"id": nikah_data.masjid_id})
-    masjid_name = masjid["name"] if masjid else ""
-    
-    nikah = Nikah(**nikah_data.dict())
-    nikah.masjid_name = masjid_name
-    nikah.venue_name = nikah_data.venue_name
-    nikah.imam_name = nikah_data.imam_name
-    nikah.imam_signature = nikah_data.imam_signature
-    nikah.masjid_signature = nikah_data.masjid_signature
-    nikah.wakeel = nikah_data.wakeel
-    nikah.witness_photos = nikah_data.witness_photos
-    nikah.witness_signatures = nikah_data.witness_signatures
-    
-    await db.nikahs.insert_one(nikah.dict())
-    
-    result = nikah.dict()
-    result.pop('_id', None)
-    return result
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT id FROM nikahs WHERE groom->>'aadhaar' = $1 OR bride->>'aadhaar' = $2",
+            nikah_data.groom.aadhaar, nikah_data.bride.aadhaar
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="Aadhaar already registered in another nikah")
+        
+        masjid_row = await conn.fetchrow("SELECT name FROM masjids WHERE id = $1", nikah_data.masjid_id)
+        masjid_name = masjid_row['name'] if masjid_row else ""
+        
+        nikah_id = str(uuid.uuid4())
+        certificate_id = f"NK{datetime.now().strftime('%Y%m%d')}{nikah_id[:6].upper()}"
+        
+        await conn.execute('''
+            INSERT INTO nikahs (id, certificate_id, masjid_id, masjid_name, groom, bride, nikah_date, mehr_amount, witnesses, witness_photos, witness_signatures, couple_photo, venue_name, imam_name, imam_signature, masjid_signature, wakeel)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        ''', nikah_id, certificate_id, nikah_data.masjid_id, masjid_name,
+            json.dumps(nikah_data.groom.dict()), json.dumps(nikah_data.bride.dict()),
+            nikah_data.nikah_date, nikah_data.mehr_amount,
+            json.dumps(nikah_data.witnesses), json.dumps(nikah_data.witness_photos),
+            json.dumps(nikah_data.witness_signatures), nikah_data.couple_photo,
+            nikah_data.venue_name, nikah_data.imam_name, nikah_data.imam_signature,
+            nikah_data.masjid_signature, nikah_data.wakeel)
+        
+        return {"id": nikah_id, "certificate_id": certificate_id, "masjid_name": masjid_name}
 
 @api_router.put("/nikahs/{nikah_id}")
 async def update_nikah(nikah_id: str, updates: Dict[str, Any], token: Dict = Depends(verify_token)):
     if token.get("type") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required for editing nikahs")
     
-    updates["updated_at"] = datetime.utcnow()
-    
-    result = await db.nikahs.update_one(
-        {"id": nikah_id},
-        {"$set": updates}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Nikah not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if "groom" in updates:
+            updates["groom"] = json.dumps(updates["groom"])
+        if "bride" in updates:
+            updates["bride"] = json.dumps(updates["bride"])
+        if "witnesses" in updates:
+            updates["witnesses"] = json.dumps(updates["witnesses"])
+        
+        set_clauses = ", ".join([f"{k} = ${i+1}" for i, k in enumerate(updates.keys())])
+        values = list(updates.values()) + [nikah_id]
+        
+        result = await conn.execute(
+            f"UPDATE nikahs SET {set_clauses}, updated_at = CURRENT_TIMESTAMP WHERE id = ${len(values)}",
+            *values
+        )
+        
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Nikah not found")
     
     return {"message": "Nikah updated"}
 
@@ -576,59 +668,74 @@ async def update_nikah(nikah_id: str, updates: Dict[str, Any], token: Dict = Dep
 
 @api_router.get("/matrimony")
 async def get_matrimony_profiles(gender: Optional[str] = None, city: Optional[str] = None):
-    query = {"status": "active"}
-    if gender:
-        query["gender"] = gender
-    if city:
-        query["city"] = {"$regex": city, "$options": "i"}
-    
-    profiles = await db.matrimony.find(query).sort("created_at", -1).to_list(1000)
-    for p in profiles:
-        p.pop('_id', None)
-        # Hide contact info unless verified
-        if not p.get("contact_shared"):
-            p["contact_phone"] = "Hidden"
-            p["contact_email"] = "Hidden"
-    return profiles
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        query = "SELECT * FROM matrimony WHERE status = 'active'"
+        params = []
+        
+        if gender:
+            params.append(gender)
+            query += f" AND gender = ${len(params)}"
+        if city:
+            params.append(f"%{city}%")
+            query += f" AND city ILIKE ${len(params)}"
+        
+        query += " ORDER BY created_at DESC"
+        
+        rows = await conn.fetch(query, *params)
+        profiles = []
+        for row in rows:
+            p = dict(row)
+            if not p.get("contact_shared"):
+                p["contact_phone"] = "Hidden"
+                p["contact_email"] = "Hidden"
+            profiles.append(p)
+        return profiles
 
 @api_router.get("/matrimony/{profile_id}")
 async def get_matrimony_profile(profile_id: str):
-    profile = await db.matrimony.find_one({"id": profile_id})
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    profile.pop('_id', None)
-    return profile
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM matrimony WHERE id = $1", profile_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return dict(row)
 
 @api_router.post("/matrimony")
 async def create_matrimony_profile(profile_data: MatrimonyCreate, token: Dict = Depends(verify_token)):
     if token.get("type") not in ["admin", "masjid"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    # Get masjid name
-    masjid = await db.masjids.find_one({"id": profile_data.masjid_id})
-    masjid_name = masjid["name"] if masjid else ""
-    
-    profile = MatrimonyProfile(**profile_data.dict())
-    profile.masjid_name = masjid_name
-    
-    await db.matrimony.insert_one(profile.dict())
-    
-    result = profile.dict()
-    result.pop('_id', None)
-    return result
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        masjid_row = await conn.fetchrow("SELECT name FROM masjids WHERE id = $1", profile_data.masjid_id)
+        masjid_name = masjid_row['name'] if masjid_row else ""
+        
+        profile_id = str(uuid.uuid4())
+        
+        await conn.execute('''
+            INSERT INTO matrimony (id, masjid_id, masjid_name, name, age, gender, education, occupation, height, marital_status, city, state, about, requirements, photo, contact_phone, contact_email)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        ''', profile_id, profile_data.masjid_id, masjid_name, profile_data.name, profile_data.age,
+            profile_data.gender, profile_data.education, profile_data.occupation, profile_data.height,
+            profile_data.marital_status, profile_data.city, profile_data.state, profile_data.about,
+            profile_data.requirements, profile_data.photo, profile_data.contact_phone, profile_data.contact_email)
+        
+        return {"id": profile_id, "name": profile_data.name}
 
 @api_router.put("/matrimony/{profile_id}/verify")
 async def verify_matrimony_profile(profile_id: str, token: Dict = Depends(verify_token)):
     if token.get("type") not in ["admin", "masjid"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    result = await db.matrimony.update_one(
-        {"id": profile_id},
-        {"$set": {"verified": True, "contact_shared": True, "updated_at": datetime.utcnow()}}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE matrimony SET verified = TRUE, contact_shared = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            profile_id
+        )
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Profile not found")
     
     return {"message": "Profile verified"}
 
@@ -637,15 +744,18 @@ async def update_matrimony_profile(profile_id: str, updates: Dict[str, Any], tok
     if token.get("type") not in ["admin", "masjid"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    updates["updated_at"] = datetime.utcnow()
-    
-    result = await db.matrimony.update_one(
-        {"id": profile_id},
-        {"$set": updates}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        set_clauses = ", ".join([f"{k} = ${i+1}" for i, k in enumerate(updates.keys())])
+        values = list(updates.values()) + [profile_id]
+        
+        result = await conn.execute(
+            f"UPDATE matrimony SET {set_clauses}, updated_at = CURRENT_TIMESTAMP WHERE id = ${len(values)}",
+            *values
+        )
+        
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Profile not found")
     
     return {"message": "Profile updated"}
 
@@ -653,57 +763,70 @@ async def update_matrimony_profile(profile_id: str, updates: Dict[str, Any], tok
 
 @api_router.get("/jobs")
 async def get_jobs(role: Optional[str] = None, masjid_id: Optional[str] = None):
-    query = {"status": "active"}
-    if role:
-        query["role"] = role
-    if masjid_id:
-        query["masjid_id"] = masjid_id
-    
-    jobs = await db.jobs.find(query).sort("created_at", -1).to_list(1000)
-    for j in jobs:
-        j.pop('_id', None)
-    return jobs
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        query = "SELECT * FROM jobs WHERE status = 'active'"
+        params = []
+        
+        if role:
+            params.append(role)
+            query += f" AND role = ${len(params)}"
+        if masjid_id:
+            params.append(masjid_id)
+            query += f" AND masjid_id = ${len(params)}"
+        
+        query += " ORDER BY created_at DESC"
+        
+        rows = await conn.fetch(query, *params)
+        return [dict(row) for row in rows]
 
 @api_router.get("/jobs/{job_id}")
 async def get_job(job_id: str):
-    job = await db.jobs.find_one({"id": job_id})
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job.pop('_id', None)
-    return job
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return dict(row)
 
 @api_router.post("/jobs")
 async def create_job(job_data: JobCreate, token: Dict = Depends(verify_token)):
     if token.get("type") not in ["admin", "masjid"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    # Get masjid name
-    masjid = await db.masjids.find_one({"id": job_data.masjid_id})
-    masjid_name = masjid["name"] if masjid else ""
-    
-    job = Job(**job_data.dict())
-    job.masjid_name = masjid_name
-    
-    await db.jobs.insert_one(job.dict())
-    
-    result = job.dict()
-    result.pop('_id', None)
-    return result
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        masjid_row = await conn.fetchrow("SELECT name FROM masjids WHERE id = $1", job_data.masjid_id)
+        masjid_name = masjid_row['name'] if masjid_row else ""
+        
+        job_id = str(uuid.uuid4())
+        
+        await conn.execute('''
+            INSERT INTO jobs (id, masjid_id, masjid_name, title, role, description, requirements, salary_range, location, contact_phone, contact_email)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ''', job_id, job_data.masjid_id, masjid_name, job_data.title, job_data.role,
+            job_data.description, job_data.requirements, job_data.salary_range,
+            job_data.location, job_data.contact_phone, job_data.contact_email)
+        
+        return {"id": job_id, "title": job_data.title}
 
 @api_router.put("/jobs/{job_id}")
 async def update_job(job_id: str, updates: Dict[str, Any], token: Dict = Depends(verify_token)):
     if token.get("type") not in ["admin", "masjid"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    updates["updated_at"] = datetime.utcnow()
-    
-    result = await db.jobs.update_one(
-        {"id": job_id},
-        {"$set": updates}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Job not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        set_clauses = ", ".join([f"{k} = ${i+1}" for i, k in enumerate(updates.keys())])
+        values = list(updates.values()) + [job_id]
+        
+        result = await conn.execute(
+            f"UPDATE jobs SET {set_clauses}, updated_at = CURRENT_TIMESTAMP WHERE id = ${len(values)}",
+            *values
+        )
+        
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Job not found")
     
     return {"message": "Job updated"}
 
@@ -712,10 +835,11 @@ async def delete_job(job_id: str, token: Dict = Depends(verify_token)):
     if token.get("type") not in ["admin", "masjid"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    result = await db.jobs.delete_one({"id": job_id})
-    
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Job not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM jobs WHERE id = $1", job_id)
+        if result == "DELETE 0":
+            raise HTTPException(status_code=404, detail="Job not found")
     
     return {"message": "Job deleted"}
 
@@ -723,44 +847,58 @@ async def delete_job(job_id: str, token: Dict = Depends(verify_token)):
 
 @api_router.get("/profiles")
 async def get_job_profiles(role: Optional[str] = None):
-    query = {"status": "active"}
-    if role:
-        query["role"] = role
-    
-    profiles = await db.job_profiles.find(query).sort("created_at", -1).to_list(1000)
-    for p in profiles:
-        p.pop('_id', None)
-    return profiles
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if role:
+            rows = await conn.fetch(
+                "SELECT * FROM job_profiles WHERE status = 'active' AND role = $1 ORDER BY created_at DESC",
+                role
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM job_profiles WHERE status = 'active' ORDER BY created_at DESC"
+            )
+        return [dict(row) for row in rows]
 
 @api_router.get("/profiles/{profile_id}")
 async def get_job_profile(profile_id: str):
-    profile = await db.job_profiles.find_one({"id": profile_id})
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    profile.pop('_id', None)
-    return profile
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM job_profiles WHERE id = $1", profile_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return dict(row)
 
 @api_router.post("/profiles")
 async def create_job_profile(profile_data: JobProfileCreate):
-    profile = JobProfile(**profile_data.dict())
-    
-    await db.job_profiles.insert_one(profile.dict())
-    
-    result = profile.dict()
-    result.pop('_id', None)
-    return result
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        profile_id = str(uuid.uuid4())
+        
+        await conn.execute('''
+            INSERT INTO job_profiles (id, name, phone, email, age, role, qualification, experience, current_location, preferred_locations, about, photo)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ''', profile_id, profile_data.name, profile_data.phone, profile_data.email,
+            profile_data.age, profile_data.role, profile_data.qualification,
+            profile_data.experience, profile_data.current_location,
+            profile_data.preferred_locations, profile_data.about, profile_data.photo)
+        
+        return {"id": profile_id, "name": profile_data.name}
 
 @api_router.put("/profiles/{profile_id}")
 async def update_job_profile(profile_id: str, updates: Dict[str, Any]):
-    updates["updated_at"] = datetime.utcnow()
-    
-    result = await db.job_profiles.update_one(
-        {"id": profile_id},
-        {"$set": updates}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        set_clauses = ", ".join([f"{k} = ${i+1}" for i, k in enumerate(updates.keys())])
+        values = list(updates.values()) + [profile_id]
+        
+        result = await conn.execute(
+            f"UPDATE job_profiles SET {set_clauses}, updated_at = CURRENT_TIMESTAMP WHERE id = ${len(values)}",
+            *values
+        )
+        
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Profile not found")
     
     return {"message": "Profile updated"}
 
@@ -768,69 +906,74 @@ async def update_job_profile(profile_id: str, updates: Dict[str, Any]):
 
 @api_router.get("/donations")
 async def get_donations(masjid_id: Optional[str] = None):
-    query = {}
-    if masjid_id:
-        query["masjid_id"] = masjid_id
-    
-    donations = await db.donations.find(query).sort("created_at", -1).to_list(1000)
-    for d in donations:
-        d.pop('_id', None)
-    return donations
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if masjid_id:
+            rows = await conn.fetch(
+                "SELECT * FROM donations WHERE masjid_id = $1 ORDER BY created_at DESC",
+                masjid_id
+            )
+        else:
+            rows = await conn.fetch("SELECT * FROM donations ORDER BY created_at DESC")
+        return [dict(row) for row in rows]
 
 @api_router.post("/donations")
 async def create_donation(donation_data: DonationCreate):
-    # Get masjid name
-    masjid = await db.masjids.find_one({"id": donation_data.masjid_id})
-    if not masjid:
-        raise HTTPException(status_code=404, detail="Masjid not found")
-    
-    donation = Donation(**donation_data.dict())
-    donation.masjid_name = masjid["name"]
-    
-    await db.donations.insert_one(donation.dict())
-    
-    result = donation.dict()
-    result.pop('_id', None)
-    return result
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        masjid_row = await conn.fetchrow("SELECT name FROM masjids WHERE id = $1", donation_data.masjid_id)
+        if not masjid_row:
+            raise HTTPException(status_code=404, detail="Masjid not found")
+        
+        donation_id = str(uuid.uuid4())
+        
+        await conn.execute('''
+            INSERT INTO donations (id, masjid_id, masjid_name, donor_name, donor_phone, amount, purpose, transaction_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ''', donation_id, donation_data.masjid_id, masjid_row['name'],
+            donation_data.donor_name, donation_data.donor_phone,
+            donation_data.amount, donation_data.purpose, donation_data.transaction_id)
+        
+        return {"id": donation_id, "masjid_name": masjid_row['name']}
 
 # ============== STATS ENDPOINT ==============
 
 @api_router.get("/stats")
 async def get_stats(masjid_id: Optional[str] = None):
-    if masjid_id:
-        # Masjid-specific stats
-        nikahs_count = await db.nikahs.count_documents({"masjid_id": masjid_id})
-        matrimony_count = await db.matrimony.count_documents({"masjid_id": masjid_id})
-        jobs_count = await db.jobs.count_documents({"masjid_id": masjid_id})
-        donations_count = await db.donations.count_documents({"masjid_id": masjid_id})
-        
-        return {
-            "nikahs": nikahs_count,
-            "matrimony": matrimony_count,
-            "jobs": jobs_count,
-            "donations": donations_count
-        }
-    else:
-        # Global stats (admin)
-        masjids_count = await db.masjids.count_documents({})
-        masjids_pending = await db.masjids.count_documents({"status": "pending"})
-        masjids_approved = await db.masjids.count_documents({"status": "approved"})
-        nikahs_count = await db.nikahs.count_documents({})
-        matrimony_count = await db.matrimony.count_documents({})
-        jobs_count = await db.jobs.count_documents({})
-        profiles_count = await db.job_profiles.count_documents({})
-        donations_count = await db.donations.count_documents({})
-        
-        return {
-            "masjids": masjids_count,
-            "masjids_pending": masjids_pending,
-            "masjids_approved": masjids_approved,
-            "nikahs": nikahs_count,
-            "matrimony": matrimony_count,
-            "jobs": jobs_count,
-            "job_profiles": profiles_count,
-            "donations": donations_count
-        }
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if masjid_id:
+            nikahs = await conn.fetchval("SELECT COUNT(*) FROM nikahs WHERE masjid_id = $1", masjid_id)
+            matrimony = await conn.fetchval("SELECT COUNT(*) FROM matrimony WHERE masjid_id = $1", masjid_id)
+            jobs = await conn.fetchval("SELECT COUNT(*) FROM jobs WHERE masjid_id = $1", masjid_id)
+            donations = await conn.fetchval("SELECT COUNT(*) FROM donations WHERE masjid_id = $1", masjid_id)
+            
+            return {
+                "nikahs": nikahs,
+                "matrimony": matrimony,
+                "jobs": jobs,
+                "donations": donations
+            }
+        else:
+            masjids = await conn.fetchval("SELECT COUNT(*) FROM masjids")
+            masjids_pending = await conn.fetchval("SELECT COUNT(*) FROM masjids WHERE status = 'pending'")
+            masjids_approved = await conn.fetchval("SELECT COUNT(*) FROM masjids WHERE status = 'approved'")
+            nikahs = await conn.fetchval("SELECT COUNT(*) FROM nikahs")
+            matrimony = await conn.fetchval("SELECT COUNT(*) FROM matrimony")
+            jobs = await conn.fetchval("SELECT COUNT(*) FROM jobs")
+            profiles = await conn.fetchval("SELECT COUNT(*) FROM job_profiles")
+            donations = await conn.fetchval("SELECT COUNT(*) FROM donations")
+            
+            return {
+                "masjids": masjids,
+                "masjids_pending": masjids_pending,
+                "masjids_approved": masjids_approved,
+                "nikahs": nikahs,
+                "matrimony": matrimony,
+                "jobs": jobs,
+                "job_profiles": profiles,
+                "donations": donations
+            }
 
 # ============== HEALTH CHECK ==============
 
@@ -853,7 +996,3 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
