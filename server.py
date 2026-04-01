@@ -55,6 +55,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 id TEXT PRIMARY KEY DEFAULT 'app_settings',
                 admin_password TEXT DEFAULT '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.VTtYV6VzMYqK6C',
+                super_admin_email TEXT DEFAULT 'muhammednali48@gmail.com',
                 registration_fee NUMERIC DEFAULT 500,
                 nikah_fee NUMERIC DEFAULT 200,
                 upi_id TEXT DEFAULT 'nikahnaama@upi',
@@ -63,9 +64,19 @@ async def init_db():
             )
         ''')
         
+        # Add super_admin_email column if it doesn't exist
+        await conn.execute('''
+            DO $$ 
+            BEGIN 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='settings' AND column_name='super_admin_email') THEN
+                    ALTER TABLE settings ADD COLUMN super_admin_email TEXT DEFAULT 'muhammednali48@gmail.com';
+                END IF;
+            END $$;
+        ''')
+        
         # Insert default settings if not exists
         await conn.execute('''
-            INSERT INTO settings (id) VALUES ('app_settings') ON CONFLICT (id) DO NOTHING
+            INSERT INTO settings (id, super_admin_email) VALUES ('app_settings', 'muhammednali48@gmail.com') ON CONFLICT (id) DO UPDATE SET super_admin_email = 'muhammednali48@gmail.com'
         ''')
         
         # Masjids table
@@ -432,6 +443,10 @@ async def admin_login(request: AdminLoginRequest):
 async def masjid_login(request: LoginRequest):
     pool = await get_db()
     async with pool.acquire() as conn:
+        # Check if this is the super admin email
+        settings_row = await conn.fetchrow("SELECT super_admin_email FROM settings WHERE id = 'app_settings'")
+        super_admin_email = settings_row['super_admin_email'] if settings_row else 'muhammednali48@gmail.com'
+        
         row = await conn.fetchrow(
             "SELECT id, name, email, password, status FROM masjids WHERE email = $1",
             request.email
@@ -446,10 +461,14 @@ async def masjid_login(request: LoginRequest):
         if not verify_password(request.password, row['password']):
             raise HTTPException(status_code=401, detail="Invalid password")
         
-        token = create_token(row['id'], "masjid", row['name'])
+        # Check if this masjid email is super admin
+        is_super_admin = request.email == super_admin_email
+        user_type = "super_admin" if is_super_admin else "masjid"
+        
+        token = create_token(row['id'], user_type, row['name'])
         return TokenResponse(
             access_token=token,
-            user_type="masjid",
+            user_type=user_type,
             user_id=row['id'],
             user_name=row['name']
         )
@@ -564,16 +583,27 @@ async def reject_masjid(masjid_id: str, token: Dict = Depends(verify_token)):
 # ============== NIKAH ENDPOINTS ==============
 
 @api_router.get("/nikahs")
-async def get_nikahs(masjid_id: Optional[str] = None):
+async def get_nikahs(masjid_id: Optional[str] = None, token: Dict = Depends(verify_token)):
     pool = await get_db()
     async with pool.acquire() as conn:
-        if masjid_id:
+        user_type = token.get("type")
+        user_id = token.get("sub")
+        
+        # Super admin and admin can see all data
+        if user_type in ["admin", "super_admin"]:
+            if masjid_id:
+                rows = await conn.fetch(
+                    "SELECT * FROM nikahs WHERE masjid_id = $1 ORDER BY created_at DESC",
+                    masjid_id
+                )
+            else:
+                rows = await conn.fetch("SELECT * FROM nikahs ORDER BY created_at DESC")
+        else:
+            # Regular masjid can only see their own data
             rows = await conn.fetch(
                 "SELECT * FROM nikahs WHERE masjid_id = $1 ORDER BY created_at DESC",
-                masjid_id
+                user_id
             )
-        else:
-            rows = await conn.fetch("SELECT * FROM nikahs ORDER BY created_at DESC")
         return [dict(row) for row in rows]
 
 @api_router.get("/nikahs/{nikah_id}")
@@ -606,7 +636,7 @@ async def check_aadhaar(aadhaar: str):
 
 @api_router.post("/nikahs")
 async def create_nikah(nikah_data: NikahCreate, token: Dict = Depends(verify_token)):
-    if token.get("type") not in ["admin", "masjid"]:
+    if token.get("type") not in ["admin", "masjid", "super_admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
     pool = await get_db()
@@ -703,7 +733,7 @@ async def get_matrimony_profile(profile_id: str):
 
 @api_router.post("/matrimony")
 async def create_matrimony_profile(profile_data: MatrimonyCreate, token: Dict = Depends(verify_token)):
-    if token.get("type") not in ["admin", "masjid"]:
+    if token.get("type") not in ["admin", "masjid", "super_admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
     pool = await get_db()
@@ -725,7 +755,7 @@ async def create_matrimony_profile(profile_data: MatrimonyCreate, token: Dict = 
 
 @api_router.put("/matrimony/{profile_id}/verify")
 async def verify_matrimony_profile(profile_id: str, token: Dict = Depends(verify_token)):
-    if token.get("type") not in ["admin", "masjid"]:
+    if token.get("type") not in ["admin", "masjid", "super_admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
     pool = await get_db()
@@ -741,7 +771,7 @@ async def verify_matrimony_profile(profile_id: str, token: Dict = Depends(verify
 
 @api_router.put("/matrimony/{profile_id}")
 async def update_matrimony_profile(profile_id: str, updates: Dict[str, Any], token: Dict = Depends(verify_token)):
-    if token.get("type") not in ["admin", "masjid"]:
+    if token.get("type") not in ["admin", "masjid", "super_admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
     pool = await get_db()
@@ -791,7 +821,7 @@ async def get_job(job_id: str):
 
 @api_router.post("/jobs")
 async def create_job(job_data: JobCreate, token: Dict = Depends(verify_token)):
-    if token.get("type") not in ["admin", "masjid"]:
+    if token.get("type") not in ["admin", "masjid", "super_admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
     pool = await get_db()
@@ -812,7 +842,7 @@ async def create_job(job_data: JobCreate, token: Dict = Depends(verify_token)):
 
 @api_router.put("/jobs/{job_id}")
 async def update_job(job_id: str, updates: Dict[str, Any], token: Dict = Depends(verify_token)):
-    if token.get("type") not in ["admin", "masjid"]:
+    if token.get("type") not in ["admin", "masjid", "super_admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
     pool = await get_db()
@@ -832,7 +862,7 @@ async def update_job(job_id: str, updates: Dict[str, Any], token: Dict = Depends
 
 @api_router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, token: Dict = Depends(verify_token)):
-    if token.get("type") not in ["admin", "masjid"]:
+    if token.get("type") not in ["admin", "masjid", "super_admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
     pool = await get_db()
