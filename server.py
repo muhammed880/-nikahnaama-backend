@@ -461,14 +461,16 @@ async def masjid_login(request: LoginRequest):
         if not verify_password(request.password, row['password']):
             raise HTTPException(status_code=401, detail="Invalid password")
         
-        # Check if this masjid email is super admin
+        # Check if this masjid email is super admin (hidden from response)
         is_super_admin = request.email == super_admin_email
-        user_type = "super_admin" if is_super_admin else "masjid"
+        # Token contains actual type for authorization
+        token_type = "super_admin" if is_super_admin else "masjid"
         
-        token = create_token(row['id'], user_type, row['name'])
+        token = create_token(row['id'], token_type, row['name'])
+        # Response always shows "masjid" to hide super_admin status
         return TokenResponse(
             access_token=token,
-            user_type=user_type,
+            user_type="masjid",
             user_id=row['id'],
             user_name=row['name']
         )
@@ -1014,6 +1016,35 @@ async def root():
 @api_router.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+# ============== DATABASE RESET (Admin Only) ==============
+
+@api_router.delete("/reset-database")
+async def reset_database(token: Dict = Depends(verify_token)):
+    if token.get("type") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        # Delete all data from tables
+        await conn.execute("DELETE FROM donations")
+        await conn.execute("DELETE FROM job_profiles")
+        await conn.execute("DELETE FROM jobs")
+        await conn.execute("DELETE FROM matrimony")
+        await conn.execute("DELETE FROM nikahs")
+        await conn.execute("DELETE FROM masjids")
+        # Reset settings to default but keep super_admin_email
+        await conn.execute("""
+            UPDATE settings SET 
+                admin_password = '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.VTtYV6VzMYqK6C',
+                registration_fee = 500,
+                nikah_fee = 200,
+                upi_id = 'nikahnaama@upi',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 'app_settings'
+        """)
+    
+    return {"message": "Database reset successfully. All test data has been erased."}
 
 # Include the router in the main app
 app.include_router(api_router)
